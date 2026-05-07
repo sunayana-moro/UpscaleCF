@@ -18,39 +18,98 @@ pretrain_model_url = {
 }
 
 
-def get_video_actual_fps(video_path):
-    """Calculate actual fps from duration and frame count to preserve original timing."""
+def get_video_frame_pts(video_path):
     try:
         output = subprocess.check_output(
             [
-                'ffprobe', '-v', 'error', '-show_entries',
-                'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1:noinfer_type=1',
+                'ffprobe', '-v', 'error',
+                '-select_streams', 'v',
+                '-show_entries', 'frame=pkt_pts_time',
+                '-of', 'csv=p=0',
                 video_path,
             ],
             stderr=subprocess.STDOUT,
-        ).decode().strip()
-        duration = float(output)
-        
-        nb_frames_output = subprocess.check_output(
+        ).decode().strip().splitlines()
+        pts = [float(line.strip()) for line in output if line.strip() != '']
+        if len(pts) == 0:
+            return None
+        return pts
+    except Exception as error:
+        print(f'Warning: could not read frame pts from {video_path}: {error}')
+        return None
+
+
+def get_video_actual_fps(video_path):
+    try:
+        duration = subprocess.check_output(
             [
-                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
-                '-show_entries', 'stream=nb_read_frames', '-of', 
-                'default=noprint_wrappers=1:nokey=1:noinfer_type=1',
+                'ffprobe', '-v', 'error',
+                '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
                 video_path,
             ],
             stderr=subprocess.STDOUT,
         ).decode().strip()
-        nb_frames = int(nb_frames_output) if nb_frames_output else None
-        
-        if duration and nb_frames and duration > 0:
+        duration = float(duration)
+        if duration <= 0:
+            return None
+
+        output = subprocess.check_output(
+            [
+                'ffprobe', '-v', 'error',
+                '-select_streams', 'v',
+                '-show_entries', 'frame=pkt_pts_time',
+                '-of', 'csv=p=0',
+                video_path,
+            ],
+            stderr=subprocess.STDOUT,
+        ).decode().strip().splitlines()
+        nb_frames = len([line for line in output if line.strip() != ''])
+
+        if nb_frames > 0:
             actual_fps = nb_frames / duration
-            print(f'Detected {nb_frames} frames in {duration:.2f}s → calculated fps: {actual_fps:.4f}')
+            print(f'Detected {nb_frames} frames over {duration:.4f}s → actual fps: {actual_fps:.6f}')
             return actual_fps
         return None
     except Exception as error:
-        print(f'Warning: could not calculate actual fps: {error}')
+        print(f'Warning: could not calculate actual fps for {video_path}: {error}')
         return None
 
+
+def save_video_with_frame_pts(img_list, frame_pts, save_path, input_video_path):
+    if len(frame_pts) != len(img_list):
+        raise ValueError('Frame timestamp count does not match number of processed frames.')
+
+    durations = []
+    for idx in range(len(frame_pts) - 1):
+        durations.append(max(frame_pts[idx + 1] - frame_pts[idx], 0.0))
+    durations.append(durations[-1] if durations else 1.0 / 25.0)
+
+    concat_list_path = os.path.join(os.path.dirname(save_path), 'ffmpeg_concat_list.txt')
+    with open(concat_list_path, 'w', encoding='utf-8') as f:
+        f.write('ffconcat version 1.0\n')
+        for img_path, duration in zip(img_list, durations):
+            f.write(f"file '{img_path}'\n")
+            f.write(f"duration {duration:.12f}\n")
+        f.write(f"file '{img_list[-1]}'\n")
+
+    cmd = [
+        'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_list_path,
+        '-i', input_video_path,
+        '-map', '0:v', '-map', '1:a?',
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+        '-c:a', 'copy', '-vsync', 'vfr', '-shortest', save_path,
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(f'Failed to save video with original timing: {error}')
+    finally:
+        if os.path.exists(concat_list_path):
+            os.remove(concat_list_path)
+
+
+def set_realesrgan():
     from basicsr.archs.rrdbnet_arch import RRDBNet
     from basicsr.utils.realesrgan_utils import RealESRGANer
 
@@ -130,16 +189,12 @@ if __name__ == '__main__':
             input_img_list.append(image)
             image = vidreader.get_frame()
         audio = vidreader.get_audio()
-        
-        # Calculate actual fps from duration and frame count to preserve timing
-        calculated_fps = get_video_actual_fps(args.input_path)
-        fps = args.save_video_fps if args.save_video_fps is not None else (calculated_fps or vidreader.get_fps())
-        
+        frame_pts = get_video_frame_pts(args.input_path)
+        fps = args.save_video_fps if args.save_video_fps is not None else (get_video_actual_fps(args.input_path) or vidreader.get_fps())
         video_name = os.path.basename(args.input_path)[:-4]
         result_root = f'results/{video_name}_{w}'
         input_video = True
         vidreader.close()
-
     else: # input img folder
         if args.input_path.endswith('/'):  # solve when path ends with /
             args.input_path = args.input_path[:-1]
@@ -293,22 +348,25 @@ if __name__ == '__main__':
     # save enhanced video
     if input_video:
         print('Video Saving...')
-        # load images
-        video_frames = []
         img_list = sorted(glob.glob(os.path.join(result_root, 'final_results', '*.[jp][pn]g')))
-        for img_path in img_list:
-            img = cv2.imread(img_path)
-            video_frames.append(img)
-        # write images to video
-        height, width = video_frames[0].shape[:2]
+        if len(img_list) == 0:
+            raise FileNotFoundError('No restored frames found for video output.')
+        height, width = cv2.imread(img_list[0]).shape[:2]
         if args.suffix is not None:
             video_name = f'{video_name}_{args.suffix}.png'
         save_restore_path = os.path.join(result_root, f'{video_name}.mp4')
-        print(f'Writing video with {len(video_frames)} frames at {fps:.4f} fps')
-        vidwriter = VideoWriter(save_restore_path, height, width, fps, audio)
-         
-        for f in video_frames:
-            vidwriter.write_frame(f)
-        vidwriter.close()
+
+        if frame_pts is not None and len(frame_pts) == len(img_list) and args.save_video_fps is None:
+            print('Preserving original frame timing via exact frame timestamps...')
+            save_video_with_frame_pts(img_list, frame_pts, save_restore_path, args.input_path)
+        else:
+            if frame_pts is not None and len(frame_pts) != len(img_list):
+                print('Warning: frame timestamp count does not match processed frames; using constant output fps.')
+            print(f'Writing output video with {fps:.6f} fps')
+            video_frames = [cv2.imread(img_path) for img_path in img_list]
+            vidwriter = VideoWriter(save_restore_path, height, width, fps, audio)
+            for f in video_frames:
+                vidwriter.write_frame(f)
+            vidwriter.close()
 
     print(f'\nAll results are saved in {result_root}')

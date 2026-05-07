@@ -10,7 +10,7 @@ scikit-image
 scipy
 tb-nightly
 torch>=1.7.1
-torchvision
+torchvision==0.15.2
 tqdm
 yapf
 lpips
